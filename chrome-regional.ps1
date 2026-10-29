@@ -70,71 +70,118 @@ function Get-CidadeFromCEP {
     }
 }
 
+# Mapa UF -> nome de região EXATO do dataset do proxy-seller (geo.json).
+# A API exige o nome por extenso com acento (DF é excecao: "Federal District" em ingles).
+$UF_TO_REGION = @{
+    "AC"="Acre"; "AL"="Alagoas"; "AP"="Amapá"; "AM"="Amazonas"; "BA"="Bahia"; "CE"="Ceará"
+    "DF"="Federal District"; "ES"="Espírito Santo"; "GO"="Goiás"; "MA"="Maranhão"; "MT"="Mato Grosso"
+    "MS"="Mato Grosso do Sul"; "MG"="Minas Gerais"; "PA"="Pará"; "PB"="Paraíba"; "PR"="Paraná"
+    "PE"="Pernambuco"; "PI"="Piauí"; "RJ"="Rio de Janeiro"; "RN"="Rio Grande do Norte"
+    "RS"="Rio Grande do Sul"; "RO"="Rondônia"; "RR"="Roraima"; "SC"="Santa Catarina"
+    "SP"="São Paulo"; "SE"="Sergipe"; "TO"="Tocantins"
+}
+
+function Test-ProxyAtivo {
+    # Confere se o proxy já autentica e devolve IP via ipinfo, pelo PROPRIO proxy.
+    # Enquanto a lista está propagando, o gateway devolve 407 (nao "pronto").
+    param([string]$login, [string]$pass, [int]$porta)
+    try {
+        $cred = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("${login}:${pass}"))
+        $headers = @{ "Proxy-Authorization" = "Basic $cred" }
+        $proxyUri = "http://res.proxy-seller.com:$porta"
+        $resp = Invoke-RestMethod -Uri "https://ipinfo.io/json" -Proxy $proxyUri -ProxyUseDefaultCredentials:$false -Headers $headers -TimeoutSec 15
+        return $resp
+    } catch {
+        return $null
+    }
+}
+
 function Get-ProxyList {
-    param([string]$cidade, [string]$regiao)
+    param([string]$cidade, [string]$uf, [int]$porta)
 
     Write-Log "Buscando lista de proxy para '$cidade'..."
 
-    # Verifica se já existe uma lista ativa
+    # 1) Reusa lista ativa existente com o mesmo nome de cidade
+    #    Endpoint correto: GET resident/lists (plural) — resident/list (singular) nao existe.
     try {
-        $lists = Invoke-RestMethod -Uri "$BASE_URL/resident/list" -TimeoutSec 30
+        $lists = Invoke-RestMethod -Uri "$BASE_URL/resident/lists" -TimeoutSec 30
         $cidadeNorm = $cidade.ToLower() -replace '[^a-z0-9]', ''
 
         foreach ($list in $lists.data) {
-            if ($list.status -eq "active") {
-                $titleNorm = $list.title.ToLower() -replace '[^a-z0-9]', ''
-                if ($titleNorm -like "*$cidadeNorm*") {
-                    Write-Log "Reusando lista existente: $($list.title)" "OK"
-                    return @{
-                        Login = $list.login
-                        Password = $list.password
-                    }
+            $titleNorm = $list.title.ToLower() -replace '[^a-z0-9]', ''
+            if ($titleNorm -like "*$cidadeNorm*") {
+                Write-Log "Reusando lista existente: $($list.title) (id $($list.id))" "OK"
+                $probe = Test-ProxyAtivo -login $list.login -pass $list.password -porta $porta
+                if ($probe) {
+                    Write-Log "Proxy ja ativo: IP $($probe.ip) ($($probe.city)/$($probe.region))" "OK"
+                    return @{ Login = $list.login; Password = $list.password }
                 }
+                Write-Log "Lista existe mas proxy nao respondeu (pode estar propagando) — seguindo com ela mesmo assim" "WARN"
+                return @{ Login = $list.login; Password = $list.password }
             }
         }
     } catch {
-        Write-Log "Erro ao buscar listas: $_" "WARN"
+        Write-Log "Erro ao buscar listas (resident/lists): $_" "WARN"
     }
 
-    # Cria nova lista
-    Write-Log "Criando nova lista para '$cidade'..."
+    # 2) Resolve nome da regiao (a API exige o nome completo com acento, nao a sigla UF)
+    $regiaoCompleta = $uf
+    if ($uf.Length -eq 2 -and $UF_TO_REGION.ContainsKey($uf.ToUpper())) {
+        $regiaoCompleta = $UF_TO_REGION[$uf.ToUpper()]
+    }
+
+    # 3) Cria nova lista — endpoint CORRETO: POST resident/list/add, com "geo" ANINHADO
+    #    (nao campos country/city soltos). rotation=-1 = IP sticky (fixo até o nó cair).
+    #    whitelist="" = autentica por login/senha (sem travar por IP de origem).
+    Write-Log "Criando nova lista para '$cidade' ($regiaoCompleta)..."
 
     $body = @{
-        title = "$cidade-$(Get-Date -Format 'yyyyMMdd')"
-        country = "BR"
-        city = $cidade
-        rotation = -1  # Sticky
-        protocol = "http"
-    }
-    if ($regiao) { $body.region = $regiao }
+        title = "$cidade-$(Get-Date -Format 'yyyyMMddHHmmss')"
+        geo = @{
+            country = "BR"
+            region  = $regiaoCompleta
+            city    = $cidade
+            isp     = ""
+        }
+        export = @{ ports = 1; ext = "txt" }
+        rotation = -1
+        whitelist = ""
+    } | ConvertTo-Json -Depth 5
 
     try {
-        $createResponse = Invoke-RestMethod -Uri "$BASE_URL/resident/list" -Method Post -Body ($body | ConvertTo-Json) -ContentType "application/json" -TimeoutSec 30
+        $createResponse = Invoke-RestMethod -Uri "$BASE_URL/resident/list/add" -Method Post -Body $body -ContentType "application/json" -TimeoutSec 30
 
-        if (-not $createResponse.data.id) {
-            Write-Log "Erro ao criar lista: $($createResponse | ConvertTo-Json)" "ERROR"
+        if ($createResponse.errors) {
+            Write-Log "API devolveu erro: $($createResponse.errors | ConvertTo-Json -Compress)" "ERROR"
+            Write-Log "Dica: erro 'IP not allowed' = o IP desta máquina precisa estar na whitelist da API (nao da lista). Cadastre em proxy-seller.com/personal/api/" "WARN"
             return $null
         }
 
+        $login = $createResponse.data.login
+        $pass  = $createResponse.data.password
         $listId = $createResponse.data.id
-        Write-Log "Lista criada (id: $listId), aguardando ativacao..."
 
-        # Aguarda lista ficar ativa
-        for ($i = 0; $i -lt 10; $i++) {
-            Start-Sleep -Seconds 3
-            $checkResponse = Invoke-RestMethod -Uri "$BASE_URL/resident/list/$listId" -TimeoutSec 15
-            if ($checkResponse.data.status -eq "active") {
-                Write-Log "Lista ativa!" "OK"
-                return @{
-                    Login = $checkResponse.data.login
-                    Password = $checkResponse.data.password
-                }
+        if (-not $login -or -not $pass) {
+            Write-Log "Resposta sem login/senha: $($createResponse | ConvertTo-Json -Compress)" "ERROR"
+            return $null
+        }
+
+        Write-Log "Lista criada (id $listId) — aguardando propagacao (pode levar de 50s a 2min)..."
+
+        # Ativação NÃO é um campo "status" pra consultar — tem que TESTAR o proxy direto.
+        for ($i = 0; $i -lt 24; $i++) {
+            Start-Sleep -Seconds 5
+            $probe = Test-ProxyAtivo -login $login -pass $pass -porta $porta
+            if ($probe) {
+                Write-Log "Proxy ativo! IP $($probe.ip) — $($probe.city)/$($probe.region)" "OK"
+                return @{ Login = $login; Password = $pass }
             }
             Write-Host "." -NoNewline
         }
 
-        Write-Log "Lista nao ativou em tempo" "ERROR"
-        return $null
+        Write-Log "" "INFO"
+        Write-Log "Lista criada mas nao propagou em 2min. Pode ainda ativar sozinha — tente abrir o Chrome mesmo assim." "WARN"
+        return @{ Login = $login; Password = $pass }
 
     } catch {
         Write-Log "Erro ao criar lista: $_" "ERROR"
@@ -221,7 +268,7 @@ if (-not $Cidade) {
 }
 
 # Busca/cria lista de proxy
-$proxy = Get-ProxyList -cidade $Cidade -regiao $Regiao
+$proxy = Get-ProxyList -cidade $Cidade -uf $Regiao -porta $Porta
 if (-not $proxy) {
     Write-Log "Nao consegui obter proxy para '$Cidade'" "ERROR"
     exit 1

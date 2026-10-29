@@ -34,9 +34,17 @@ cd chrome-proxy-regional-windows
 
 ## Como Funciona
 
-1. O script consulta a API do proxy-seller e cria uma lista residencial na cidade
-2. Abre o Chrome com proxy configurado (cada porta = 1 IP sticky diferente)
-3. O Chrome sai pela rede residencial daquela cidade
+1. O script consulta a API do proxy-seller (`resident/lists` / `resident/list/add`) e cria (ou reusa) uma lista residencial com geo travado na cidade
+2. Aguarda a lista propagar (50s a 2min) testando o proxy de verdade, não só consultando "status"
+3. Abre o Chrome com proxy configurado (cada porta = 1 IP sticky diferente)
+4. O Chrome vai pedir usuário/senha do proxy na primeira aba — digite os dados que aparecem no terminal
+
+## IMPORTANTE — Dois tipos de "whitelist" diferentes (não confundir)
+
+1. **Whitelist da LISTA de proxy**: controla quem pode USAR aquele proxy. Por padrão o script deixa vazia (autentica por usuário/senha, por isso o Chrome pede login).
+2. **Whitelist de acesso à API**: controla de quais IPs o SCRIPT pode chamar a API do proxy-seller. Se der erro `"IP not allowed"`, é esta que falta — cadastre o IP da máquina que roda o script em **proxy-seller.com/personal/api/** (botão Submit). Para saber o IP: https://whatismyipaddress.com
+
+Se seu IP de internet mudar, pode voltar a dar esse erro — basta recadastrar o IP novo na mesma página.
 
 ## Parâmetros
 
